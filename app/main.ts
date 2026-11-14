@@ -65,6 +65,27 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 			},
 		},
 	},
+	{
+		type: "function",
+		function: {
+			name: "Skill",
+			description: "Load a skill's instructions into the conversation",
+			parameters: {
+				type: "object",
+				required: ["name"],
+				properties: {
+					name: {
+						type: "string",
+						description: "The name of the skillto use",
+					},
+					args: {
+						type: "string",
+						description: "Optional arguments for the skill",
+					},
+				},
+			},
+		},
+	},
 ];
 
 function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
@@ -127,14 +148,14 @@ function loadSkills(): Map<string, Skill> {
 	return skills;
 }
 
-function resolveSkill(skillName: string, skillsMap: Map<string, Skill>) : Skill | null {
+function resolveSkill(skillName: string, skillsMap: Map<string, Skill>): Skill | null {
 
 	if (!skillName || skillName.includes("/") || skillName.includes("\\")) {
 		return null;
 	}
 
 	return (
-		skillsMap.get(skillName) ?? 
+		skillsMap.get(skillName) ??
 		parseSkillFile(
 			path.join(process.cwd(), ".claude", "skills", skillName, "SKILL.md"),
 			skillName
@@ -142,9 +163,8 @@ function resolveSkill(skillName: string, skillsMap: Map<string, Skill>) : Skill 
 	)
 }
 
-function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>): 
-	{expandedSkills: Skill[]; rawArgs: string} {
-	
+function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>): { expandedSkills: Skill[]; rawArgs: string } {
+
 	const expandedSkills: Skill[] = [];
 	let remaining = prompt.trimStart();
 
@@ -160,7 +180,7 @@ function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>):
 		expandedSkills.push(matched);
 		remaining = spaceIdx === -1 ? "" : remaining.slice(spaceIdx).trimStart();
 	}
-	return { expandedSkills, rawArgs: remaining.trim()}
+	return { expandedSkills, rawArgs: remaining.trim() }
 }
 
 function substituteSkillArgs(body: string, rawArgs: string): string {
@@ -171,11 +191,12 @@ function substituteSkillArgs(body: string, rawArgs: string): string {
 		.replace(/\$ARGUMENTS\[(\d+)\]/g, (_, idx) => args[Number(idx)] ?? "")
 		.replace(/\$ARGUMENTS\b/g, rawArgs)
 		.replace(/\$(\d+)\b/g, (_, idx) => args[Number(idx)] ?? "")
-} 
+}
 
 function executeTool(
 	name: string,
-	rawArgs: string | Record<string, unknown>
+	rawArgs: string | Record<string, unknown>,
+	skillsMap: Map<string, Skill>
 ): string {
 	const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
 
@@ -210,6 +231,15 @@ function executeTool(
 				const stderr = err.stderr ? String(err.stderr) : "";
 				return `${stdout}${stderr}` || `error: ${err.message}`;
 			}
+		}
+		case "Skill": {
+			const skillName = String(args.name ?? "");
+			const skillArgs = args.args ? String(args.args) : "";
+			const matched = resolveSkill(skillName, skillsMap);
+			if (!matched) {
+				return `error: unknown skill '${skillName}'`;
+			}
+			return substituteSkillArgs(matched.body, skillArgs);
 		}
 		default: {
 			return `error: unknown tool '${name}'`;
@@ -255,10 +285,10 @@ async function main() {
 				role: "user",
 				content: substituteSkillArgs(skill.body, rawArgs)
 			});
-		} 
-	} 
+		}
+	}
 	else {
-		messages.push({role: "user", content: prompt});
+		messages.push({ role: "user", content: prompt });
 	}
 
 	const client = new OpenAI({
@@ -288,6 +318,7 @@ async function main() {
 				const result = executeTool(
 					toolCall.function.name,
 					toolCall.function.arguments,
+					skillsMap
 				);
 
 				messages.push({
