@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import fs from "node:fs"
 import path from "node:path";
+import { execSync } from "node:child_process";
 
 const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 	{
@@ -41,6 +42,23 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 			},
 		},
 	},
+	{
+		type: "function",
+		function: {
+			name: "Bash",
+			description: "Execute a Shell command",
+			parameters: {
+				type: "object",
+				required: ["command"],
+				properties: {
+					command: {
+						type: "string",
+						description: "The Shell command to execute",
+					},
+				},
+			},
+		},
+	},
 ];
 
 function executeTool(
@@ -67,6 +85,18 @@ function executeTool(
 				return `Successfully wrote ${Buffer.byteLength(content)} bytes to {filePath}`;
 			} catch (err) {
 				return `error: ${err as Error}.message`;
+			}
+		}
+		case "Bash": {
+			try {
+				return execSync(String(args.command), {
+					encoding: "utf-8",
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+			} catch (err: any) {
+				const stdout = err.stdout ? String(err.stdout) : "";
+				const stderr = err.stderr ? String(err.stderr) : "";
+				return `${stdout}${stderr}` || `error: ${err.message}`;
 			}
 		}
 		default: {
