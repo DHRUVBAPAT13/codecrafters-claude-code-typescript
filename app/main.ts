@@ -1,25 +1,46 @@
 import OpenAI from "openai";
 import fs from "node:fs"
-import { Responses } from "openai/resources";
+import path from "node:path";
 
 const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "Read",
-      description: "Read and return the contents of a file",
-      parameters: {
-        type: "object",
-        properties: {
-          file_path: {
-            type: "string",
-            description: "The path to the file to read",
-          },
-        },
-        required: ["file_path"],
-      },
-    },
-  },
+	{
+		type: "function",
+		function: {
+			name: "Read",
+			description: "Read and return the contents of a file",
+			parameters: {
+				type: "object",
+				properties: {
+					file_path: {
+						type: "string",
+						description: "The path to the file to read",
+					},
+				},
+				required: ["file_path"],
+			},
+		},
+	},
+	{
+		type: "function",
+		function: {
+			name: "Write",
+			description: "Write a content to a file",
+			parameters: {
+				type: "object",
+				required: ["file_path", "content"],
+				properties: {
+					file_path: {
+						type: "string",
+						description: "The path of the file to write to",
+					},
+					content: {
+						type: "string",
+						description: "The content to write to the file",
+					},
+				},
+			},
+		},
+	},
 ];
 
 function executeTool(
@@ -34,6 +55,18 @@ function executeTool(
 				return fs.readFileSync(String(args.file_path), "utf-8")
 			} catch (err) {
 				return `error: ${(err as Error).message}`;
+			}
+		}
+		case "Write": {
+			try {
+				const filePath = String(args.file_path);
+				const content = String(args.content ?? "");
+				
+				fs.mkdirSync(path.dirname(filePath), {recursive: true});
+				fs.writeFileSync(filePath, content, "utf-8");
+				return `Successfully wrote ${Buffer.byteLength(content)} bytes to {filePath}`;
+			} catch (err) {
+				return `error: ${err as Error}.message`;
 			}
 		}
 		default: {
@@ -61,8 +94,8 @@ async function main() {
 		baseURL: baseURL,
 	});
 
-	const messages : OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-		{ role: "user", content: prompt},
+	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+		{ role: "user", content: prompt },
 	];
 
 	while (true) {
@@ -86,7 +119,7 @@ async function main() {
 				console.error(`[Tool] Executing ${toolCall.function.name}...`);
 				const result = executeTool(
 					toolCall.function.name,
-					toolCall.function.arguments,				
+					toolCall.function.arguments,
 				);
 
 				messages.push({
