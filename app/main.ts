@@ -362,7 +362,7 @@ async function main() {
 		baseURL: baseURL,
 	});
 
-	const finalOutput = runAgentLoop(client, messages, skillsMap);
+	const finalOutput = await runAgentLoop(client, messages, skillsMap);
 	if (finalOutput) {
 		console.log(finalOutput);
 	}
