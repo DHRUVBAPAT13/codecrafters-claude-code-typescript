@@ -2,10 +2,12 @@ import OpenAI from "openai";
 import fs, { existsSync } from "node:fs"
 import path from "node:path";
 import { execSync } from "node:child_process";
+import { Messages } from "openai/resources/chat/completions.mjs";
 
 interface Skill {
 	name: string;
 	description: string;
+	context?: string,
 	body: string;
 }
 
@@ -107,6 +109,7 @@ function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
 
 	let name = fallbackName;
 	let description = "";
+	let context: string | undefined;
 
 	for (const line of frontmatter.split(/\r?\n/)) {
 
@@ -121,9 +124,10 @@ function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
 
 		if (key === "name" && value) name = value;
 		if (key === "description") description = value;
+		if (key === "context") context = value;
 	}
 
-	return { name, description, body };
+	return { name, description, context, body };
 }
 
 function loadSkills(): Map<string, Skill> {
@@ -160,10 +164,11 @@ function resolveSkill(skillName: string, skillsMap: Map<string, Skill>): Skill |
 			path.join(process.cwd(), ".claude", "skills", skillName, "SKILL.md"),
 			skillName
 		)
-	)
+	);
 }
 
-function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>): { expandedSkills: Skill[]; rawArgs: string } {
+function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>): 
+{ expandedSkills: Skill[]; rawArgs: string } {
 
 	const expandedSkills: Skill[] = [];
 	let remaining = prompt.trimStart();
@@ -173,7 +178,7 @@ function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>): { ex
 		const token = spaceIdx === -1 ? remaining.slice(1) : remaining.slice(1, spaceIdx);
 		const matched = resolveSkill(token, skillsMap);
 
-		if (!matched) {
+		if (!matched || matched.context === "fork") {
 			break;
 		}
 
@@ -193,17 +198,19 @@ function substituteSkillArgs(body: string, rawArgs: string): string {
 		.replace(/\$(\d+)\b/g, (_, idx) => args[Number(idx)] ?? "")
 }
 
-function executeTool(
+async function executeTool(
 	name: string,
 	rawArgs: string | Record<string, unknown>,
-	skillsMap: Map<string, Skill>
-): string {
+	skillsMap: Map<string, Skill>,
+	client: OpenAI
+): Promise<string> {
+
 	const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
 
 	switch (name) {
 		case "Read": {
 			try {
-				return fs.readFileSync(String(args.file_path), "utf-8")
+				return fs.readFileSync(String(args.file_path), "utf-8");
 			} catch (err) {
 				return `error: ${(err as Error).message}`;
 			}
@@ -239,11 +246,70 @@ function executeTool(
 			if (!matched) {
 				return `error: unknown skill '${skillName}'`;
 			}
-			return substituteSkillArgs(matched.body, skillArgs);
+			const body = substituteSkillArgs(matched.body, skillArgs);
+
+			if (matched.context === "fork") {
+				console.error(`[Subagent] Forking skill '${matched.name}'`);
+				const subagentMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = 
+					[{ role: "user", content: body }]
+				const subagentResult = await runAgentLoop(
+					client,
+					subagentMessages,
+					skillsMap
+				);
+				return `Skill ${matched.name} ran in a separate context and returned: ${subagentResult}`;
+			}
+			return body;
 		}
 		default: {
 			return `error: unknown tool '${name}'`;
 		}
+	}
+}
+
+async function runAgentLoop(
+	client: OpenAI, 
+	messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+	skillMap: Map<string, Skill>
+): Promise<string> {
+
+	while (true) {
+		const response = await client.chat.completions.create({
+			model: "anthropic/claude-haiku-4.5",
+			messages: messages,
+			tools: TOOLS,
+		});
+
+		if (!response.choices || response.choices.length === 0) {
+			throw new Error("no choices in response");
+		}
+
+		const message = response.choices[0].message;
+		messages.push(message);
+
+		if (message.tool_calls && message.tool_calls.length > 0) {
+			for (const toolCall of message.tool_calls) {
+
+				if (toolCall.type !== "function") continue;
+
+				console.error(`[Tool] Executing ${toolCall.function.name}...`);
+				const result = await executeTool(
+					toolCall.function.name,
+					toolCall.function.arguments,
+					skillMap,
+					client
+				);
+
+				messages.push({
+					role: "tool",
+					tool_call_id: toolCall.id,
+					content: result
+				});
+			}
+			continue;
+		}
+
+		return message.content ?? "";
 	}
 }
 
@@ -273,7 +339,7 @@ async function main() {
 
 		messages.push({
 			role: "system",
-			content: `You have access to the following skills:\n\n${skillList}`,
+			content: `You have access to the following skills:\n\n${skillList}\n\nIf a skill matches the user's request, call the Skill tool with its name\nand follow the instructions it returns.`,
 		});
 	}
 
@@ -296,44 +362,9 @@ async function main() {
 		baseURL: baseURL,
 	});
 
-	while (true) {
-		const response = await client.chat.completions.create({
-			model: "anthropic/claude-haiku-4.5",
-			messages: messages,
-			tools: TOOLS,
-		});
-
-		if (!response.choices || response.choices.length === 0) {
-			throw new Error("no choices in response");
-		}
-
-		const message = response.choices[0].message;
-		messages.push(message);
-
-		if (message.tool_calls && message.tool_calls.length > 0) {
-			for (const toolCall of message.tool_calls) {
-				if (toolCall.type !== "function") continue;
-
-				console.error(`[Tool] Executing ${toolCall.function.name}...`);
-				const result = executeTool(
-					toolCall.function.name,
-					toolCall.function.arguments,
-					skillsMap
-				);
-
-				messages.push({
-					role: "tool",
-					tool_call_id: toolCall.id,
-					content: result,
-				});
-			}
-			continue;
-		}
-
-		if (message.content) {
-			console.log(message.content);
-		}
-		break;
+	const finalOutput = runAgentLoop(client, messages, skillsMap);
+	if (finalOutput) {
+		console.log(finalOutput);
 	}
 }
 
