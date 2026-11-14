@@ -127,6 +127,42 @@ function loadSkills(): Map<string, Skill> {
 	return skills;
 }
 
+function resolveSkill(skillName: string, skillsMap: Map<string, Skill>) : Skill | null {
+
+	if (!skillName || skillName.includes("/") || skillName.includes("\\")) {
+		return null;
+	}
+
+	return (
+		skillsMap.get(skillName) ?? 
+		parseSkillFile(
+			path.join(process.cwd(), ".claude", "skills", skillName, "SKILL.md"),
+			skillName
+		)
+	)
+}
+
+function expandStackedSkill(prompt: string, skillsMap: Map<string, Skill>): 
+	{expandedSkills: Skill[]; rawArgs: string} {
+	
+	const expandedSkills: Skill[] = [];
+	let remaining = prompt.trimStart();
+
+	while (remaining.startsWith("/")) {
+		const spaceIdx = remaining.search(/\s/)
+		const token = spaceIdx === -1 ? remaining.slice(1) : remaining.slice(1, spaceIdx);
+		const matched = resolveSkill(token, skillsMap);
+
+		if (!matched) {
+			break;
+		}
+
+		expandedSkills.push(matched);
+		remaining = spaceIdx === -1 ? "" : remaining.slice(spaceIdx).trimStart();
+	}
+	return { expandedSkills, rawArgs: remaining.trim()}
+}
+
 function substituteSkillArgs(body: string, rawArgs: string): string {
 
 	const args = rawArgs ? rawArgs.split(/\s+/) : [];
@@ -211,26 +247,19 @@ async function main() {
 		});
 	}
 
-	let userContent = prompt;
-	if (prompt.startsWith("/")) {
-		const spaceIdx = prompt.search(/\s/);
-		const skillName =
-			spaceIdx === -1 ? prompt.slice(1) : prompt.slice(1, spaceIdx);
-		const rawArgs = spaceIdx === -1 ? "" : prompt.slice(spaceIdx).trim();
+	const { expandedSkills, rawArgs } = expandStackedSkill(prompt, skillsMap);
 
-		const matchedSkill =
-			skillsMap.get(skillName) ??
-			parseSkillFile(
-				path.join(process.cwd(), ".claude", "skills", skillName, "SKILL.md"),
-				skillName
-			);
-
-		if (matchedSkill) {
-			userContent = substituteSkillArgs(matchedSkill.body, rawArgs);
-		}
+	if (expandedSkills.length > 0) {
+		for (const skill of expandedSkills) {
+			messages.push({
+				role: "user",
+				content: substituteSkillArgs(skill.body, rawArgs)
+			});
+		} 
+	} 
+	else {
+		messages.push({role: "user", content: prompt});
 	}
-
-	messages.push({ role: "user", content: userContent });
 
 	const client = new OpenAI({
 		apiKey: apiKey,
