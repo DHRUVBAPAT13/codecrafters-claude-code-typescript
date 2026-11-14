@@ -127,6 +127,16 @@ function loadSkills(): Map<string, Skill> {
 	return skills;
 }
 
+function substituteSkillArgs(body: string, rawArgs: string): string {
+
+	const args = rawArgs ? rawArgs.split(/\s+/) : [];
+
+	return body
+		.replace(/\$ARGUMENTS\[(\d+)\]/g, (_, idx) => args[Number(idx)] ?? "")
+		.replace(/\$ARGUMENTS\b/g, rawArgs)
+		.replace(/\$(\d+)\b/g, (_, idx) => args[Number(idx)] ?? "")
+} 
+
 function executeTool(
 	name: string,
 	rawArgs: string | Record<string, unknown>
@@ -206,7 +216,7 @@ async function main() {
 		const spaceIdx = prompt.search(/\s/);
 		const skillName =
 			spaceIdx === -1 ? prompt.slice(1) : prompt.slice(1, spaceIdx);
-		const rest = spaceIdx === -1 ? "" : prompt.slice(spaceIdx).trim();
+		const rawArgs = spaceIdx === -1 ? "" : prompt.slice(spaceIdx).trim();
 
 		const matchedSkill =
 			skillsMap.get(skillName) ??
@@ -216,7 +226,7 @@ async function main() {
 			);
 
 		if (matchedSkill) {
-			userContent = rest ? `${matchedSkill.body}\n\n${rest}` : matchedSkill.body;
+			userContent = substituteSkillArgs(matchedSkill.body, rawArgs);
 		}
 	}
 
