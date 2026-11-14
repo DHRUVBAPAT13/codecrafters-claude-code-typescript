@@ -1,7 +1,13 @@
 import OpenAI from "openai";
-import fs from "node:fs"
+import fs, { existsSync } from "node:fs"
 import path from "node:path";
 import { execSync } from "node:child_process";
+
+interface Skill {
+	name: string;
+	description: string;
+	body: string;
+}
 
 const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 	{
@@ -61,6 +67,66 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 	},
 ];
 
+function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
+	if (!fs.existsSync(filePath)) return null;
+
+	const raw = fs.readFileSync(filePath, "utf-8");
+	const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+
+	if (!match) {
+		return {
+			name: fallbackName,
+			description: "",
+			body: raw.trim(),
+		}
+	}
+
+	const frontmatter = match[1];
+	const body = match[2].trim();
+
+	let name = fallbackName;
+	let description = "";
+
+	for (const line of frontmatter.split(/\r?\n/)) {
+
+		const colonIdx = line.indexOf(":");
+		if (colonIdx === -1) continue;
+
+		const key = line.slice(0, colonIdx).trim();
+		const value = line
+			.slice(colonIdx + 1)
+			.trim()
+			.replace(/^["']["']$/g, "");
+
+		if (key === "name" && value) name = value;
+		if (key === "description") description = value;
+	}
+
+	return { name, description, body };
+}
+
+function loadSkills(): Map<string, Skill> {
+	const skills = new Map<string, Skill>();
+	const skillsDir = path.join(process.cwd(), ".claude", "skills");
+
+	if (!fs.existsSync(skillsDir)) return skills;
+
+	for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+
+		if (!entry.isDirectory()) continue;
+
+		const skillFile = path.join(skillsDir, entry.name, "SKILL.md");
+		const parsed = parseSkillFile(skillFile, entry.name);
+
+		if (parsed) {
+			skills.set(entry.name, parsed);
+			skills.set(parsed.name, parsed);
+		}
+	}
+
+	return skills;
+}
+
 function executeTool(
 	name: string,
 	rawArgs: string | Record<string, unknown>
@@ -79,8 +145,8 @@ function executeTool(
 			try {
 				const filePath = String(args.file_path);
 				const content = String(args.content ?? "");
-				
-				fs.mkdirSync(path.dirname(filePath), {recursive: true});
+
+				fs.mkdirSync(path.dirname(filePath), { recursive: true });
 				fs.writeFileSync(filePath, content, "utf-8");
 				return `Successfully wrote ${Buffer.byteLength(content)} bytes to {filePath}`;
 			} catch (err) {
@@ -119,14 +185,47 @@ async function main() {
 		throw new Error("error: -p flag is required");
 	}
 
+	const skillsMap = loadSkills();
+	const uniqueSkills = Array.from(new Set(skillsMap.values()))
+
+	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+
+	if (uniqueSkills.length > 0) {
+		const skillList = uniqueSkills
+			.map((s) => `- ${s.name}: ${s.description}`)
+			.join("\n");
+
+		messages.push({
+			role: "system",
+			content: `You have access to the following skills:\n\n${skillList}`,
+		});
+	}
+
+	let userContent = prompt;
+	if (prompt.startsWith("/")) {
+		const spaceIdx = prompt.search(/\s/);
+		const skillName =
+			spaceIdx === -1 ? prompt.slice(1) : prompt.slice(1, spaceIdx);
+		const rest = spaceIdx === -1 ? "" : prompt.slice(spaceIdx).trim();
+
+		const matchedSkill =
+			skillsMap.get(skillName) ??
+			parseSkillFile(
+				path.join(process.cwd(), ".claude", "skills", skillName, "SKILL.md"),
+				skillName
+			);
+
+		if (matchedSkill) {
+			userContent = rest ? `${matchedSkill.body}\n\n${rest}` : matchedSkill.body;
+		}
+	}
+
+	messages.push({ role: "user", content: userContent });
+
 	const client = new OpenAI({
 		apiKey: apiKey,
 		baseURL: baseURL,
 	});
-
-	const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-		{ role: "user", content: prompt },
-	];
 
 	while (true) {
 		const response = await client.chat.completions.create({
