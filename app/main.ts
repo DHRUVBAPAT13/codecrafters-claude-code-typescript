@@ -4,7 +4,6 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { LSPClient } from "./lsp_client";
-import { version } from "node:os";
 
 interface Skill {
     name: string;
@@ -128,6 +127,7 @@ const LSP_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
 };
 
 function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
+
     if (!fs.existsSync(filePath)) return null;
 
     const raw = fs.readFileSync(filePath, "utf-8");
@@ -167,6 +167,7 @@ function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
 }
 
 function loadSkills(): Map<string, Skill> {
+
     const skills = new Map<string, Skill>();
     const skillsDir = path.join(process.cwd(), ".claude", "skills");
 
@@ -191,6 +192,7 @@ function resolveSkill(
     skillName: string,
     skillsMap: Map<string, Skill>
 ): Skill | null {
+
     if (!skillName || skillName.includes("/") || skillName.includes("\\")) {
         return null;
     }
@@ -208,6 +210,7 @@ function expandStackedSkill(
     prompt: string,
     skillsMap: Map<string, Skill>
 ): { expandedSkills: Skill[]; rawArgs: string } {
+
     const expandedSkills: Skill[] = [];
     let remaining = prompt.trimStart();
 
@@ -228,6 +231,7 @@ function expandStackedSkill(
 }
 
 function substituteSkillArgs(body: string, rawArgs: string): string {
+    
     const args = rawArgs ? rawArgs.split(/\s+/) : [];
 
     return body
@@ -266,11 +270,10 @@ async function syncWrittenDocument(
     text: string,
     documentVersions: Map<string, number>
 ): Promise<void> {
-
     const ext = path.extname(absPath);
-    const languageID = lspClient.extensionToLanguage?.[ext];
-    if (!languageID) return;
-    
+    const languageId = lspClient.extensionToLanguage?.[ext];
+    if (!languageId) return;
+
     const uri = pathToFileURL(absPath).href;
     const currentVersion = documentVersions.get(uri);
 
@@ -278,7 +281,7 @@ async function syncWrittenDocument(
         await lspClient.notify("textDocument/didOpen", {
             textDocument: {
                 uri,
-                languageID,
+                languageId,
                 version: 1,
                 text,
             },
@@ -286,7 +289,7 @@ async function syncWrittenDocument(
         documentVersions.set(uri, 1);
     } else {
         const nextVersion = currentVersion + 1;
-        await lspClient.notify("textDocument/didOpen", {
+        await lspClient.notify("textDocument/didChange", {
             textDocument: {
                 uri,
                 version: nextVersion,
@@ -302,6 +305,7 @@ async function handleLspTool(
     lspClient: LSPClient | null,
     documentVersions: Map<string, number>
 ): Promise<string> {
+
     if (!lspClient) {
         return "error: LSP client is not configured";
     }
@@ -425,6 +429,7 @@ async function executeTool(
     lspClient: LSPClient | null,
     documentVersions: Map<string, number>
 ): Promise<string> {
+
     const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
 
     switch (name) {
@@ -439,9 +444,20 @@ async function executeTool(
             try {
                 const filePath = String(args.file_path);
                 const content = String(args.content ?? "");
+                const absPath = path.resolve(process.cwd(), filePath);
 
-                fs.mkdirSync(path.dirname(filePath), { recursive: true });
-                fs.writeFileSync(filePath, content, "utf-8");
+                fs.mkdirSync(path.dirname(absPath), { recursive: true });
+                fs.writeFileSync(absPath, content, "utf-8");
+
+                if (lspClient) {
+                    await syncWrittenDocument(
+                        lspClient,
+                        absPath,
+                        content,
+                        documentVersions
+                    );
+                }
+
                 return `Successfully wrote ${Buffer.byteLength(content)} bytes to ${filePath}`;
             } catch (err) {
                 return `error: ${(err as Error).message}`;
@@ -501,6 +517,7 @@ async function runAgentLoop(
     lspClient: LSPClient | null,
     documentVersions: Map<string, number>
 ): Promise<string> {
+
     while (true) {
         const response = await client.chat.completions.create({
             model: "anthropic/claude-haiku-4.5",
