@@ -108,12 +108,12 @@ const LSP_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
 					description: "Aboslute path, or a path relative to the agent's current working directory",
 				},
 				line: {
-					type: "instegr",
+					type: "integer",
 					minimum: 1,
 					description: "1-based line number of symbol",
 				},
 				character: {
-					type: "instegr",
+					type: "integer",
 					minimum: 1,
 					description: "1-based character offset in UTF-16 code units (same as character count for ASCII)",
 				},
@@ -319,7 +319,7 @@ async function runAgentLoop(
 		const response = await client.chat.completions.create({
 			model: "anthropic/claude-haiku-4.5",
 			messages: messages,
-			tools: BASE_TOOLS,
+			tools: tools,
 		});
 
 		if (!response.choices || response.choices.length === 0) {
