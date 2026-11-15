@@ -4,6 +4,7 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { LSPClient } from "./lsp_client";
+import { version } from "node:os";
 
 interface Skill {
     name: string;
@@ -239,9 +240,10 @@ async function ensureDocumentOpen(
     lspClient: LSPClient,
     absPath: string,
     uri: string,
-    openedUris: Set<string>
+    documentVersions: Map<string, number>
 ): Promise<void> {
-    if (openedUris.has(uri)) return;
+
+    if (documentVersions.has(uri)) return;
 
     const ext = path.extname(absPath);
     const languageId = lspClient.extensionToLanguage?.[ext] ?? "plaintext";
@@ -255,13 +257,50 @@ async function ensureDocumentOpen(
             text,
         },
     });
-    openedUris.add(uri);
+    documentVersions.set(uri, 1);
+}
+
+async function syncWrittenDocument(
+    lspClient: LSPClient,
+    absPath: string,
+    text: string,
+    documentVersions: Map<string, number>
+): Promise<void> {
+
+    const ext = path.extname(absPath);
+    const languageID = lspClient.extensionToLanguage?.[ext];
+    if (!languageID) return;
+    
+    const uri = pathToFileURL(absPath).href;
+    const currentVersion = documentVersions.get(uri);
+
+    if (currentVersion === undefined) {
+        await lspClient.notify("textDocument/didOpen", {
+            textDocument: {
+                uri,
+                languageID,
+                version: 1,
+                text,
+            },
+        });
+        documentVersions.set(uri, 1);
+    } else {
+        const nextVersion = currentVersion + 1;
+        await lspClient.notify("textDocument/didOpen", {
+            textDocument: {
+                uri,
+                version: nextVersion,
+            },
+            contentChanges: [{ text }],
+        });
+        documentVersions.set(uri, nextVersion);
+    }
 }
 
 async function handleLspTool(
     args: Record<string, unknown>,
     lspClient: LSPClient | null,
-    openedUris: Set<string>
+    documentVersions: Map<string, number>
 ): Promise<string> {
     if (!lspClient) {
         return "error: LSP client is not configured";
@@ -277,7 +316,7 @@ async function handleLspTool(
         const uri = pathToFileURL(absPath).href;
 
         if (operation === "goToDefinition") {
-            await ensureDocumentOpen(lspClient, absPath, uri, openedUris);
+            await ensureDocumentOpen(lspClient, absPath, uri, documentVersions);
 
             const rawResponse = await lspClient.request(
                 "textDocument/definition",
@@ -316,7 +355,7 @@ async function handleLspTool(
         }
 
         if (operation === "findReferences") {
-            await ensureDocumentOpen(lspClient, absPath, uri, openedUris);
+            await ensureDocumentOpen(lspClient, absPath, uri, documentVersions);
 
             const rawResponse = await lspClient.request(
                 "textDocument/references",
@@ -384,7 +423,7 @@ async function executeTool(
     client: OpenAI,
     tools: OpenAI.Chat.Completions.ChatCompletionTool[],
     lspClient: LSPClient | null,
-    openedUris: Set<string>
+    documentVersions: Map<string, number>
 ): Promise<string> {
     const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
 
@@ -439,14 +478,14 @@ async function executeTool(
                     skillsMap,
                     tools,
                     lspClient,
-                    openedUris
+                    documentVersions
                 );
                 return `Skill ${matched.name} ran in a separate context and returned: ${subagentResult}`;
             }
             return body;
         }
         case "LSP": {
-            return handleLspTool(args, lspClient, openedUris);
+            return handleLspTool(args, lspClient, documentVersions);
         }
         default: {
             return `error: unknown tool '${name}'`;
@@ -460,7 +499,7 @@ async function runAgentLoop(
     skillMap: Map<string, Skill>,
     tools: OpenAI.Chat.Completions.ChatCompletionTool[],
     lspClient: LSPClient | null,
-    openedUris: Set<string>
+    documentVersions: Map<string, number>
 ): Promise<string> {
     while (true) {
         const response = await client.chat.completions.create({
@@ -488,7 +527,7 @@ async function runAgentLoop(
                     client,
                     tools,
                     lspClient,
-                    openedUris
+                    documentVersions
                 );
 
                 messages.push({
@@ -523,7 +562,7 @@ async function main() {
     }
 
     const tools = lspClient ? [...BASE_TOOLS, LSP_TOOL] : BASE_TOOLS;
-    const openedUris = new Set<string>();
+    const documentVersions = new Map<string, number>();
 
     const skillsMap = loadSkills();
     const uniqueSkills = Array.from(new Set(skillsMap.values()));
@@ -565,7 +604,7 @@ async function main() {
         skillsMap,
         tools,
         lspClient,
-        openedUris
+        documentVersions
     );
     if (finalOutput) {
         console.log(finalOutput);
