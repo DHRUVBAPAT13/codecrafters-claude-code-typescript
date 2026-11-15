@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import fs, { existsSync } from "node:fs"
 import path from "node:path";
 import { execSync } from "node:child_process";
-import { Messages } from "openai/resources/chat/completions.mjs";
+import { LSPClient } from "./lsp_client";
 
 interface Skill {
 	name: string;
@@ -11,7 +11,7 @@ interface Skill {
 	body: string;
 }
 
-const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+const BASE_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 	{
 		type: "function",
 		function: {
@@ -90,6 +90,39 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 	},
 ];
 
+const LSP_TOOL: OpenAI.Chat.Completions.ChatCompletionTool = {
+
+	type: "function",
+	function: {
+		name: "LSP",
+		description: "Returns the file, line, and character where a symbol is defined. Line and character inputs are 1-based.",
+		parameters: {
+			type: "object",
+			properties: {
+				operation: {
+					type: "string",
+					enum: ["goToDefinition"],
+				},
+				filePath: {
+					type: "string",
+					description: "Aboslute path, or a path relative to the agent's current working directory",
+				},
+				line: {
+					type: "instegr",
+					minimum: 1,
+					description: "1-based line number of symbol",
+				},
+				character: {
+					type: "instegr",
+					minimum: 1,
+					description: "1-based character offset in UTF-16 code units (same as character count for ASCII)",
+				},
+			},
+			required: ["operation", "filePath", "line", "character"],
+		},
+	},
+};
+
 function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
 	if (!fs.existsSync(filePath)) return null;
 
@@ -120,7 +153,7 @@ function parseSkillFile(filePath: string, fallbackName: string): Skill | null {
 		const value = line
 			.slice(colonIdx + 1)
 			.trim()
-			.replace(/^["']["']$/g, "");
+			.replace(/^["']|["']$/g, "");
 
 		if (key === "name" && value) name = value;
 		if (key === "description") description = value;
@@ -202,7 +235,9 @@ async function executeTool(
 	name: string,
 	rawArgs: string | Record<string, unknown>,
 	skillsMap: Map<string, Skill>,
-	client: OpenAI
+	client: OpenAI,
+	tools: OpenAI.Chat.Completions.ChatCompletionTool[],
+	lspClient: LSPClient | null
 ): Promise<string> {
 
 	const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
@@ -222,9 +257,9 @@ async function executeTool(
 
 				fs.mkdirSync(path.dirname(filePath), { recursive: true });
 				fs.writeFileSync(filePath, content, "utf-8");
-				return `Successfully wrote ${Buffer.byteLength(content)} bytes to {filePath}`;
+				return `Successfully wrote ${Buffer.byteLength(content)} bytes to ${filePath}`;
 			} catch (err) {
-				return `error: ${err as Error}.message`;
+				return `error: ${(err as Error).message}`;
 			}
 		}
 		case "Bash": {
@@ -255,11 +290,16 @@ async function executeTool(
 				const subagentResult = await runAgentLoop(
 					client,
 					subagentMessages,
-					skillsMap
+					skillsMap,
+					tools,
+					lspClient
 				);
 				return `Skill ${matched.name} ran in a separate context and returned: ${subagentResult}`;
 			}
 			return body;
+		}
+		case "LSP": {
+			return "LSP is not implemented yet";
 		}
 		default: {
 			return `error: unknown tool '${name}'`;
@@ -270,14 +310,16 @@ async function executeTool(
 async function runAgentLoop(
 	client: OpenAI, 
 	messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-	skillMap: Map<string, Skill>
+	skillMap: Map<string, Skill>,
+	tools: OpenAI.Chat.Completions.ChatCompletionTool[],
+	lspClient: LSPClient | null
 ): Promise<string> {
 
 	while (true) {
 		const response = await client.chat.completions.create({
 			model: "anthropic/claude-haiku-4.5",
 			messages: messages,
-			tools: TOOLS,
+			tools: BASE_TOOLS,
 		});
 
 		if (!response.choices || response.choices.length === 0) {
@@ -297,7 +339,9 @@ async function runAgentLoop(
 					toolCall.function.name,
 					toolCall.function.arguments,
 					skillMap,
-					client
+					client,
+					tools,
+					lspClient
 				);
 
 				messages.push({
@@ -326,6 +370,13 @@ async function main() {
 	if (flag !== "-p" || !prompt) {
 		throw new Error("error: -p flag is required");
 	}
+
+	const lspClient = await LSPClient.fromEnvironment();
+	if (lspClient) {
+		console.error("LSP client connected");
+	}
+
+	const tools = lspClient ? [...BASE_TOOLS, LSP_TOOL] : BASE_TOOLS;
 
 	const skillsMap = loadSkills();
 	const uniqueSkills = Array.from(new Set(skillsMap.values()))
@@ -362,7 +413,7 @@ async function main() {
 		baseURL: baseURL,
 	});
 
-	const finalOutput = await runAgentLoop(client, messages, skillsMap);
+	const finalOutput = await runAgentLoop(client, messages, skillsMap, tools, lspClient);
 	if (finalOutput) {
 		console.log(finalOutput);
 	}
