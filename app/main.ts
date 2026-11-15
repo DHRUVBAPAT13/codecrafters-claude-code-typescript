@@ -319,10 +319,11 @@ function formatDiagnosticKey(diag: DiagnosticItem): string{
 
 async function drainNewDiagnostics(
     lspClient: LSPClient,
-    lspState: LspState
+    lspState: LspState,
+    timeoutMs = 0
 ): Promise<string> {
 
-    const res = (await lspClient.notifications(lspState.notificationCursor, 0)) as {
+    const res = (await lspClient.notifications(lspState.notificationCursor, timeoutMs)) as {
         cursor?: number;
         notifications?: Array<{
             method?: string;
@@ -565,6 +566,8 @@ async function executeTool(
                 fs.mkdirSync(path.dirname(absPath), { recursive: true });
                 fs.writeFileSync(absPath, content, "utf-8");
 
+                let result = `Successfully wrote ${Buffer.byteLength(content)} bytes to ${filePath}`;
+
                 if (lspClient) {
                     await syncWrittenDocument(
                         lspClient,
@@ -572,9 +575,17 @@ async function executeTool(
                         content,
                         lspState.documentVersions
                     );
+                    const diagnosticsFeedback = await drainNewDiagnostics(
+                        lspClient,
+                        lspState,
+                        50
+                    );
+                    if (diagnosticsFeedback) {
+                        result = `${result}\n\n${diagnosticsFeedback}`;
+                    }
                 }
-
-                return `Successfully wrote ${Buffer.byteLength(content)} bytes to ${filePath}`;
+                return result;
+                
             } catch (err) {
                 return `error: ${(err as Error).message}`;
             }
@@ -639,7 +650,8 @@ async function runAgentLoop(
         if (lspClient) {
             const diagnosticsFeedback = await drainNewDiagnostics(
                 lspClient,
-                lspState
+                lspState,
+                0
             );
             if (diagnosticsFeedback) {
                 const lastMsg = messages[messages.length - 1];
