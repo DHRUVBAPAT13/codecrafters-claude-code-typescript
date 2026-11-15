@@ -12,6 +12,18 @@ interface Skill {
     body: string;
 }
 
+interface DiagnosticItem {
+    line: number;
+    character: number;
+    message: string;
+}
+
+interface LspState {
+    documentVersions: Map<string, number>;
+    notificationCursor: number;
+    lastShownDiagnostics: Map<string, Set<string>>;
+}
+
 const BASE_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     {
         type: "function",
@@ -231,7 +243,7 @@ function expandStackedSkill(
 }
 
 function substituteSkillArgs(body: string, rawArgs: string): string {
-    
+
     const args = rawArgs ? rawArgs.split(/\s+/) : [];
 
     return body
@@ -300,10 +312,114 @@ async function syncWrittenDocument(
     }
 }
 
+function formatDiagnosticKey(diag: DiagnosticItem): string{
+
+    return `${diag.line}:${diag.character}:${diag.message}`
+}
+
+async function drainNewDiagnostics(
+    lspClient: LSPClient,
+    lspState: LspState
+): Promise<string> {
+
+    const res = (await lspClient.notifications(lspState.notificationCursor, 0)) as {
+        cursor?: number;
+        notifications?: Array<{
+            method?: string;
+            params?: {
+                uri?: string;
+                version?: number;
+                diagnostics?: Array<{
+                    range?: { start?: { line?: number; character?: number; } };
+                    message?: string;
+                }>;
+            };
+        }>;
+    };
+
+    if (typeof res?.cursor === "number") {
+        lspState.notificationCursor = res.cursor;
+    }
+
+    const notifications = Array.isArray(res?.notifications) ? res.notifications : [];
+
+    const latestCurrentByUri = new Map<string, DiagnosticItem[]>();
+
+    for (const notif of notifications) {
+        if (notif?.method !== "textDocument/publishDiagnostics") continue;
+        const params = notif.params;
+        if (!params?.uri) continue;
+
+        const recordedVersion = lspState.documentVersions.get(params.uri);
+        if (
+            typeof params.version === "number" &&
+            recordedVersion !== undefined &&
+            params.version !== recordedVersion
+        ) {
+            continue;
+        }
+
+        const items: DiagnosticItem[] = [];
+        for (const d of params.diagnostics ?? []) {
+            if (!d?.range?.start || typeof d.message !== "string") continue;
+            items.push({
+                line: Number(d.range.start.line) + 1,
+                character: Number(d.range.start.character) + 1,
+                message: d.message,
+            });
+        }
+        latestCurrentByUri.set(params.uri, items);
+    }
+
+    if (latestCurrentByUri.size === 0) {
+        return "";
+    }
+
+    const newByFile = new Map<string, string[]>();
+
+    for (const [uri, currentItems] of latestCurrentByUri.entries()) {
+        const prevShown =
+            lspState.lastShownDiagnostics.get(uri) ?? new Set<string>();
+        const nextShown = new Set<string>();
+        const freshLines: string[] = [];
+
+        for (const item of currentItems) {
+            const key = formatDiagnosticKey(item);
+            nextShown.add(key);
+            if (!prevShown.has(key)) {
+                freshLines.push(
+                    `  [Line ${item.line}:${item.character}] ${item.message}`
+                );
+            }
+        }
+
+        lspState.lastShownDiagnostics.set(uri, nextShown);
+
+        if (freshLines.length > 0) {
+            const absPath = fileURLToPath(uri);
+            const relPath =
+                path.relative(process.cwd(), absPath) ||
+                path.basename(absPath);
+            newByFile.set(relPath, freshLines);
+        }
+    }
+
+    if (newByFile.size === 0) {
+        return "";
+    }
+
+    const sections: string[] = [];
+    for (const [relPath, lines] of newByFile.entries()) {
+        sections.push(`${relPath}:\n${lines.join("\n")}`);
+    }
+
+    return `<new-diagnostics>The following new diagnostic issues were detected:\n\n${sections.join("\n\n")}</new-diagnostics>`;
+}
+
 async function handleLspTool(
     args: Record<string, unknown>,
     lspClient: LSPClient | null,
-    documentVersions: Map<string, number>
+    lspState: LspState
 ): Promise<string> {
 
     if (!lspClient) {
@@ -320,7 +436,7 @@ async function handleLspTool(
         const uri = pathToFileURL(absPath).href;
 
         if (operation === "goToDefinition") {
-            await ensureDocumentOpen(lspClient, absPath, uri, documentVersions);
+            await ensureDocumentOpen(lspClient, absPath, uri, lspState.documentVersions);
 
             const rawResponse = await lspClient.request(
                 "textDocument/definition",
@@ -359,7 +475,7 @@ async function handleLspTool(
         }
 
         if (operation === "findReferences") {
-            await ensureDocumentOpen(lspClient, absPath, uri, documentVersions);
+            await ensureDocumentOpen(lspClient, absPath, uri, lspState.documentVersions);
 
             const rawResponse = await lspClient.request(
                 "textDocument/references",
@@ -427,7 +543,7 @@ async function executeTool(
     client: OpenAI,
     tools: OpenAI.Chat.Completions.ChatCompletionTool[],
     lspClient: LSPClient | null,
-    documentVersions: Map<string, number>
+    lspState: LspState
 ): Promise<string> {
 
     const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
@@ -454,7 +570,7 @@ async function executeTool(
                         lspClient,
                         absPath,
                         content,
-                        documentVersions
+                        lspState.documentVersions
                     );
                 }
 
@@ -494,14 +610,14 @@ async function executeTool(
                     skillsMap,
                     tools,
                     lspClient,
-                    documentVersions
+                    lspState,
                 );
                 return `Skill ${matched.name} ran in a separate context and returned: ${subagentResult}`;
             }
             return body;
         }
         case "LSP": {
-            return handleLspTool(args, lspClient, documentVersions);
+            return handleLspTool(args, lspClient, lspState);
         }
         default: {
             return `error: unknown tool '${name}'`;
@@ -515,10 +631,29 @@ async function runAgentLoop(
     skillMap: Map<string, Skill>,
     tools: OpenAI.Chat.Completions.ChatCompletionTool[],
     lspClient: LSPClient | null,
-    documentVersions: Map<string, number>
+    lspState: LspState
 ): Promise<string> {
 
     while (true) {
+
+        if (lspClient) {
+            const diagnosticsFeedback = await drainNewDiagnostics(
+                lspClient,
+                lspState
+            );
+            if (diagnosticsFeedback) {
+                const lastMsg = messages[messages.length - 1];
+                if (lastMsg && lastMsg.role === "tool") {
+                    lastMsg.content = `${String(lastMsg.content)}\n\n${diagnosticsFeedback}`;
+                } else {
+                    messages.push({
+                        role: "user",
+                        content: diagnosticsFeedback,
+                    });
+                }
+            }
+        }
+
         const response = await client.chat.completions.create({
             model: "anthropic/claude-haiku-4.5",
             messages: messages,
@@ -544,7 +679,7 @@ async function runAgentLoop(
                     client,
                     tools,
                     lspClient,
-                    documentVersions
+                    lspState
                 );
 
                 messages.push({
@@ -579,7 +714,11 @@ async function main() {
     }
 
     const tools = lspClient ? [...BASE_TOOLS, LSP_TOOL] : BASE_TOOLS;
-    const documentVersions = new Map<string, number>();
+    const lspState: LspState = {
+        documentVersions: new Map<string, number>(),
+        notificationCursor: 0,
+        lastShownDiagnostics: new Map<string, Set<string>>(),
+    };
 
     const skillsMap = loadSkills();
     const uniqueSkills = Array.from(new Set(skillsMap.values()));
@@ -621,7 +760,7 @@ async function main() {
         skillsMap,
         tools,
         lspClient,
-        documentVersions
+        lspState
     );
     if (finalOutput) {
         console.log(finalOutput);
