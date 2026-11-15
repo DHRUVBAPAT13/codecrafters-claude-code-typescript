@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import fs, { existsSync } from "node:fs"
 import path from "node:path";
 import { execSync } from "node:child_process";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { LSPClient } from "./lsp_client";
 
 interface Skill {
@@ -231,13 +232,86 @@ function substituteSkillArgs(body: string, rawArgs: string): string {
 		.replace(/\$(\d+)\b/g, (_, idx) => args[Number(idx)] ?? "")
 }
 
+async function handleLSPTool(
+	args: Record<string, unknown>,
+	lspClient: LSPClient | null,
+	openedUris: Set<string>
+): Promise<string> {
+
+	if (!lspClient) {
+		return "error: LSP client is not configured";
+	}
+
+	const operation = String(args.operation ?? "");
+	const rawFilePath = String(args.filePath ?? "");
+	const line = Number(args.line);
+	const character = Number(args.character);
+
+	if (operation !== "goToDefinition") {
+		return `error: unsupported LSP operation '${operation}'`;
+	}
+
+	try {
+		const absPath = path.resolve(process.cwd(), rawFilePath);
+		const uri = pathToFileURL(absPath).href;
+
+		if (!openedUris.has(uri)) {
+			const ext = path.extname(absPath);
+			const languageID = lspClient.extensionToLanguage?.[ext] ?? "plaintext";
+			const text = fs.readFileSync(absPath, "utf-8");
+
+			await lspClient.notify("textDocument/didOpen", {
+				textDocument: {
+					uri,
+					languageID,
+					version: 1,
+					text,
+				},
+			});
+			openedUris.add(uri);
+		}
+
+		const rawResponse = await lspClient.request("textDocument/definition", {
+			textDocument: { uri },
+			position: {
+				line: line - 1,
+				character: character - 1,
+			},
+		});
+
+		const location = Array.isArray(rawResponse) ? rawResponse[0] : rawResponse;
+
+		if (!location) {
+			return "No definition found";
+		}
+
+		const targetUri: string = location.uri ?? location.targetUri;
+		const range = location.range ?? location.targetSelectionRange;
+
+		if (!targetUri || !range.start) {
+			return "No definition found";
+		}
+
+		const targetAbsPath = fileURLToPath(targetUri);
+		const relPath = path.relative(process.cwd(), targetAbsPath) || path.basename(targetAbsPath);
+
+		const defLine = Number(range.start.line) + 1;
+		const defChar = Number(range.start.character) + 1;
+
+		return `Defined in ${relPath}:${defLine}:${defChar}`;
+	} catch(err) {
+		return `error: ${(err as Error).message}`;
+	}
+};
+
 async function executeTool(
 	name: string,
 	rawArgs: string | Record<string, unknown>,
 	skillsMap: Map<string, Skill>,
 	client: OpenAI,
 	tools: OpenAI.Chat.Completions.ChatCompletionTool[],
-	lspClient: LSPClient | null
+	lspClient: LSPClient | null,
+	openedUris: Set<string>
 ): Promise<string> {
 
 	const args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
@@ -292,14 +366,15 @@ async function executeTool(
 					subagentMessages,
 					skillsMap,
 					tools,
-					lspClient
+					lspClient,
+					openedUris
 				);
 				return `Skill ${matched.name} ran in a separate context and returned: ${subagentResult}`;
 			}
 			return body;
 		}
 		case "LSP": {
-			return "LSP is not implemented yet";
+			return handleLSPTool(args, lspClient, openedUris)
 		}
 		default: {
 			return `error: unknown tool '${name}'`;
@@ -312,7 +387,8 @@ async function runAgentLoop(
 	messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
 	skillMap: Map<string, Skill>,
 	tools: OpenAI.Chat.Completions.ChatCompletionTool[],
-	lspClient: LSPClient | null
+	lspClient: LSPClient | null,
+	openedUris: Set<string>
 ): Promise<string> {
 
 	while (true) {
@@ -341,7 +417,8 @@ async function runAgentLoop(
 					skillMap,
 					client,
 					tools,
-					lspClient
+					lspClient,
+					openedUris
 				);
 
 				messages.push({
@@ -377,6 +454,7 @@ async function main() {
 	}
 
 	const tools = lspClient ? [...BASE_TOOLS, LSP_TOOL] : BASE_TOOLS;
+	const openedUris = new Set<string>();
 
 	const skillsMap = loadSkills();
 	const uniqueSkills = Array.from(new Set(skillsMap.values()))
@@ -413,7 +491,7 @@ async function main() {
 		baseURL: baseURL,
 	});
 
-	const finalOutput = await runAgentLoop(client, messages, skillsMap, tools, lspClient);
+	const finalOutput = await runAgentLoop(client, messages, skillsMap, tools, lspClient, openedUris);
 	if (finalOutput) {
 		console.log(finalOutput);
 	}
